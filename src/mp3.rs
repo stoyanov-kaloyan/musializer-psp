@@ -1,3 +1,4 @@
+use crate::fft::FFT_SIZE;
 use crate::utils::AssetStream;
 use core::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use core::{ffi::c_void, ptr};
@@ -20,6 +21,7 @@ const PCM_BUF_SIZE: usize = 16 * (1152 / 2); // PCM output buffer
 
 static mut MP3_BUF: Align64<[u8; MP3_BUF_SIZE]> = Align64([0; MP3_BUF_SIZE]);
 static mut PCM_BUF: Align64<[u8; PCM_BUF_SIZE]> = Align64([0; PCM_BUF_SIZE]);
+static mut PCM_RING: Align64<[i16; FFT_SIZE]> = Align64([0; FFT_SIZE]);
 
 /// Find the start of the actual MP3 stream by skipping metadata tags (ID3v2, APE)
 /// Returns the byte offset where the MP3 audio data begins
@@ -133,6 +135,19 @@ fn mp3_feed(instance: &mut Mp3Instance) -> Result<bool, i32> {
                 unsafe {
                     (&*instance.shared).set_level(lvl);
                 }
+                // push samples into PCM ring buffer for analyzer
+                let write_base = unsafe {
+                    (&*instance.shared)
+                        .pcm_write
+                        .fetch_add(sample_count as i32, Ordering::Relaxed)
+                } as isize;
+                for (i, &s) in samples.iter().enumerate() {
+                    let idx = ((write_base + i as isize) % FFT_SIZE as isize + FFT_SIZE as isize)
+                        % FFT_SIZE as isize;
+                    unsafe {
+                        PCM_RING.0[idx as usize] = s;
+                    }
+                }
             }
         }
     }
@@ -171,6 +186,7 @@ struct SharedState {
     error: AtomicBool,
     last_error: AtomicI32,
     level: AtomicI32,
+    pcm_write: AtomicI32,
 }
 
 impl SharedState {
@@ -181,6 +197,7 @@ impl SharedState {
             error: AtomicBool::new(false),
             last_error: AtomicI32::new(0),
             level: AtomicI32::new(0),
+            pcm_write: AtomicI32::new(0),
         }
     }
 
@@ -419,10 +436,37 @@ impl Mp3Player {
         Ok(!shared.finished.load(Ordering::Relaxed))
     }
 
-    /// Returns last computed level 0..100
+    /// copy latest `FFT_SIZE` samples into `out` as normalized f32 in [-1.0, 1.0].
+    /// returns number of samples written (FFT_SIZE) or 0 on error.
+    pub fn snapshot_pcm(&self, out: &mut [f32]) -> usize {
+        if out.len() < FFT_SIZE {
+            return 0;
+        }
+        let shared = unsafe { &*self.shared };
+        let write = shared.pcm_write.load(Ordering::Relaxed) as isize;
+        let start = write - FFT_SIZE as isize;
+
+        unsafe {
+            for i in 0..FFT_SIZE {
+                let idx = ((start + i as isize) % FFT_SIZE as isize + FFT_SIZE as isize)
+                    % FFT_SIZE as isize;
+                let s = PCM_RING.0[idx as usize];
+                out[i] = s as f32 / i16::MAX as f32;
+            }
+        }
+        FFT_SIZE
+    }
+
+    /// returns last computed level 0..100
     pub fn level(&self) -> i32 {
         let shared = unsafe { &*self.shared };
         shared.level.load(Ordering::Relaxed)
+    }
+
+    /// return the raw shared pointer for external threads to snapshot PCM
+    /// this returns an opaque pointer that can be passed to `snapshot_from_shared`
+    pub fn raw_shared_ptr(&self) -> *mut core::ffi::c_void {
+        self.shared as *mut core::ffi::c_void
     }
 
     /// Stop playback
@@ -431,6 +475,30 @@ impl Mp3Player {
         let shared = unsafe { &*self.shared };
         shared.stop_requested.store(true, Ordering::Relaxed);
     }
+}
+
+/// snapshot PCM samples using a raw shared pointer returned by `Mp3Player::raw_shared_ptr`
+/// copies `FFT_SIZE` samples into `out` as normalized f32 in [-1.0, 1.0]
+pub fn snapshot_from_shared(shared_ptr: *mut core::ffi::c_void, out: &mut [f32]) -> usize {
+    if out.len() < FFT_SIZE {
+        return 0;
+    }
+    if shared_ptr.is_null() {
+        return 0;
+    }
+    let shared = unsafe { &*(shared_ptr as *mut SharedState) };
+    let write = shared.pcm_write.load(Ordering::Relaxed) as isize;
+    let start = write - FFT_SIZE as isize;
+
+    unsafe {
+        for i in 0..FFT_SIZE {
+            let idx =
+                ((start + i as isize) % FFT_SIZE as isize + FFT_SIZE as isize) % FFT_SIZE as isize;
+            let s = PCM_RING.0[idx as usize];
+            out[i] = s as f32 / i16::MAX as f32;
+        }
+    }
+    FFT_SIZE
 }
 
 impl Drop for Mp3Player {
