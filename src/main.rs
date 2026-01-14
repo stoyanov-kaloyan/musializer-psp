@@ -9,6 +9,7 @@ mod utils;
 
 use alloc::boxed::Box;
 use alloc::vec;
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use core::{ffi::c_void, ptr};
 use fft::Analyzer;
@@ -30,8 +31,19 @@ static mut LIST: Align16<[u32; 0x40000]> = Align16([0; 0x40000]);
 // pointer to 1x1 white texture stored in VRAM (set in init_gu)
 static mut WHITE_VRAM_PTR: *mut core::ffi::c_void = core::ptr::null_mut();
 
-static SPECTRUM_SIZE: usize = 64;
-static mut SPECTRUM: Align16<[f32; 64]> = Align16([0.0; 64]);
+#[repr(C, align(4))]
+struct ColVertex {
+    color: u32,
+    x: f32,
+    y: f32,
+    z: f32,
+}
+
+// persistent CPU-side vertex buffer to avoid calling `sceGuGetMemory` each frame
+static mut VERTEX_BUFFER: Align16<[u8; 16 * (64 * 2)]> = Align16([0; 16 * (64 * 2)]);
+
+const SPECTRUM_SIZE: usize = 64;
+static mut SPECTRUM: Align16<[f32; SPECTRUM_SIZE]> = Align16([0.0; SPECTRUM_SIZE]);
 static SPECTRUM_GEN: AtomicI32 = AtomicI32::new(0);
 static SPECTRUM_STOP: AtomicBool = AtomicBool::new(false);
 
@@ -83,13 +95,25 @@ fn psp_main() {
                 };
             }
 
+            // precompute xs
+            let margin = 20.0f32;
+            let width_avail = SCREEN_WIDTH as f32 - margin * 2.0f32;
+            let cell_w = width_avail / (SPECTRUM_SIZE as f32);
+            let precomputed_xs: [f32; SPECTRUM_SIZE] = {
+                let mut xs = [0.0f32; SPECTRUM_SIZE];
+                for i in 0..SPECTRUM_SIZE {
+                    xs[i] = margin + i as f32 * cell_w;
+                }
+                xs
+            };
+
             // local render loop reads SPECTRUM written by FFT thread
             loop {
                 match player.tick() {
                     Ok(true) => {
-                        // copy shared spectrum snapshot into local buffer
-                        let mut display_m = 64usize;
-                        let mut local = [0.0f32; 64];
+                        // copy shared spectrum snapshot into local fixed-size buffer
+                        let display_m = SPECTRUM_SIZE;
+                        let mut local = [0.0f32; SPECTRUM_SIZE];
                         let _gen = SPECTRUM_GEN.load(Ordering::Acquire);
                         unsafe {
                             for i in 0..display_m {
@@ -99,14 +123,6 @@ fn psp_main() {
 
                         // draw frame with GU
                         unsafe {
-                            #[repr(C, align(4))]
-                            struct ColVertex {
-                                color: u32,
-                                x: f32,
-                                y: f32,
-                                z: f32,
-                            }
-
                             sys::sceGuStart(
                                 GuContextType::Direct,
                                 &raw mut LIST.0 as *mut _ as *mut c_void,
@@ -118,21 +134,19 @@ fn psp_main() {
                             );
 
                             sys::sceGuDisable(GuState::Texture2D);
-                            let margin = 20.0f32;
                             let bottom = SCREEN_HEIGHT as f32 - 40.0f32;
                             let width_avail = SCREEN_WIDTH as f32 - margin * 2.0f32;
-                            let cell_w = width_avail / (display_m as f32);
                             let max_h = (SCREEN_HEIGHT as f32) * 0.5f32;
 
                             let verts_count = (display_m * 2) as i32;
-                            let vertices = sys::sceGuGetMemory(
-                                (verts_count as usize * core::mem::size_of::<ColVertex>()) as i32,
-                            ) as *mut ColVertex;
+                            // ignore this please
+                            let vertices = core::ptr::addr_of_mut!(VERTEX_BUFFER.0) as *mut u8
+                                as *mut ColVertex;
 
                             for i in 0..display_m {
                                 let t = local[i] as f32;
                                 let bar_h = (t.max(0.0) * max_h) as f32;
-                                let x = margin + i as f32 * cell_w;
+                                let x = precomputed_xs[i];
                                 let y = bottom - bar_h;
 
                                 let base = (i * 2) as isize;
@@ -189,7 +203,7 @@ fn psp_main() {
                     }
                 }
 
-                unsafe { sys::sceKernelDelayThreadCB(5000) };
+                // unsafe { sys::sceKernelDelayThreadCB(5000) };
             }
         }
         Err(_) => {
@@ -290,19 +304,19 @@ extern "C" fn fft_thread_main(_args: usize, argp: *mut c_void) -> i32 {
 
         let analyzer = unsafe { &mut *analyzer_ptr };
         let m = analyzer.analyze(&samples, 1.0 / 60.0);
-        let display_m = if m > 64 { 64 } else { m };
+        let display_m = if m > SPECTRUM_SIZE { SPECTRUM_SIZE } else { m };
 
         unsafe {
             for i in 0..display_m {
                 SPECTRUM.0[i] = analyzer.out_smooth[i];
             }
-            for i in display_m..64 {
+            for i in display_m..SPECTRUM_SIZE {
                 SPECTRUM.0[i] = 0.0;
             }
         }
         SPECTRUM_GEN.fetch_add(1, Ordering::Release);
 
-        unsafe { sys::sceKernelDelayThreadCB(33333) };
+        // unsafe { sys::sceKernelDelayThreadCB(33333) };
     }
 
     unsafe { drop(Box::from_raw(analyzer_ptr)) };
